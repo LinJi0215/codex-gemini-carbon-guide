@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import sqlite3
@@ -13,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from urllib.parse import urlparse
@@ -129,7 +131,86 @@ def scoped_read_settings(paths):
     return {'permissions': permissions}
 
 
-def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, trace=False, read_paths=None, timeout_seconds=600):
+def agy_status(conversation_id):
+    """Read one known conversation's status; it may be stale or unavailable."""
+    if not conversation_id or not UUID.fullmatch(conversation_id): return 'unknown'
+    index = Path.home() / '.gemini' / 'antigravity-cli' / 'conversation_summaries.db'
+    try:
+        with contextlib.closing(sqlite3.connect(index.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
+            row = db.execute('SELECT status,not_fully_idle FROM conversation_summaries WHERE conversation_id=?', (conversation_id,)).fetchone()
+        if row and row[0] == 'CASCADE_RUN_STATUS_RUNNING' and row[1]: return 'index_reports_running'
+        if row and row[0] == 'CASCADE_RUN_STATUS_IDLE' and not row[1]: return 'index_reports_idle'
+    except (sqlite3.Error, OSError):
+        pass
+    return 'unknown'
+
+
+def capture_stream(args, cwd, request, *, timeout_seconds=0, progress_interval=180, timeout_grace=30):
+    """Drain both pipes while waiting for a terminal result; never retry a turn."""
+    proc = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', bufsize=1)
+    incoming = queue.Queue()
+    def reader(label, stream):
+        try:
+            for line in stream: incoming.put((label, line))
+        finally:
+            stream.close()
+            incoming.put((label, None))
+    def writer():
+        try:
+            proc.stdin.write(request)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            incoming.put(('writer_error', str(exc)))
+            try: proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError): pass
+    workers = []
+    for target, arguments in ((reader, ('out', proc.stdout)), (reader, ('err', proc.stderr)), (writer, ())):
+        worker = threading.Thread(target=target, args=arguments, daemon=True)
+        worker.start()
+        workers.append(worker)
+    def stop_process():
+        proc.kill()
+        proc.wait()
+        for worker in workers: worker.join(timeout=2)
+    events, stderr_parts = [], []
+    closed = set()
+    cid = None
+    start = time.monotonic()
+    next_progress = start + progress_interval
+    last_activity = start
+    while len(closed) < 2 or proc.poll() is None:
+        now = time.monotonic()
+        if timeout_seconds and now - start >= timeout_seconds + timeout_grace:
+            stop_process()
+            raise RuntimeError('agy client timed out; the remote turn may still be running. No success was recorded; do not automatically retry.')
+        if now >= next_progress:
+            status = agy_status(cid)
+            print(f'agy waiting: elapsed={int(now-start)}s last_event={int(now-last_activity)}s ago status={status}; status may be stale, continuing to wait.', file=sys.stderr, flush=True)
+            next_progress = now + progress_interval
+        try:
+            label, line = incoming.get(timeout=min(1.0, max(.01, next_progress-now)))
+        except queue.Empty:
+            continue
+        if line is None:
+            closed.add(label)
+        elif label == 'out':
+            if not line.strip(): continue
+            try: event = json.loads(line)
+            except json.JSONDecodeError:
+                stop_process()
+                raise RuntimeError('agy returned invalid JSON; no mapping was saved')
+            events.append(event)
+            last_activity = time.monotonic()
+            if event.get('event') == 'init': cid = event.get('conversation_id')
+        elif label == 'err':
+            stderr_parts.append(line)
+        else:
+            stderr_parts.append('stdin write failed: ' + line)
+    return events, ''.join(stderr_parts)[-8000:], proc.wait()
+
+
+def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, trace=False, read_paths=None, timeout_seconds=0):
     exe = shutil.which('agy.exe') or shutil.which('agy')
     if not exe:
         raise RuntimeError('agy executable not found')
@@ -152,20 +233,16 @@ def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, 
             raise RuntimeError('Stored conversation belongs to a different project; refusing to send')
     try:
         request = json.dumps({'event': 'user', 'message': {'content': prompt}}, ensure_ascii=False) + '\n'
+        events, stderr, returncode = capture_stream(args, cwd, request, timeout_seconds=timeout_seconds)
         try:
-            p = subprocess.run(args, cwd=cwd, input=request, capture_output=True, encoding='utf-8', errors='replace', timeout=timeout_seconds + 30)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError('agy client timed out; the remote turn may still be running. No success was recorded; do not automatically retry.')
-        try:
-            events = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
             result = next(e['result'] for e in reversed(events) if e.get('event') == 'result')
-        except (json.JSONDecodeError, KeyError, StopIteration):
-            raise RuntimeError('agy returned no valid JSON; no mapping was saved. ' + p.stderr[-1000:])
-        if p.returncode or result.get('status') != 'SUCCESS' or not result.get('response'):
+        except (KeyError, StopIteration):
+            raise RuntimeError('agy returned no valid result; no mapping was saved. ' + stderr[-1000:])
+        if returncode or result.get('status') != 'SUCCESS' or not result.get('response'):
             detail = result.get('error') or ('empty response' if not result.get('response') else result.get('status'))
-            if 'print_timeout' in p.stderr or 'print timeout' in p.stderr:
-                raise RuntimeError('agy print timeout; the turn may still be in progress. No success was recorded; do not automatically retry. ' + p.stderr[-1000:])
-            raise RuntimeError('agy failed; no new mapping was saved: ' + str(detail) + ' ' + p.stderr[-1000:])
+            if 'print_timeout' in stderr or 'print timeout' in stderr:
+                raise RuntimeError('agy print timeout; the turn may still be in progress. No success was recorded; do not automatically retry. ' + stderr[-1000:])
+            raise RuntimeError('agy failed; no new mapping was saved: ' + str(detail) + ' ' + stderr[-1000:])
         cid = result.get('conversation_id', '')
         if not UUID.fullmatch(cid):
             raise RuntimeError('agy did not return a valid conversation ID; no mapping was saved')
@@ -234,7 +311,7 @@ def main():
     parser.add_argument('--trace', action='store_true', help='Include completed tool calls from this turn')
     parser.add_argument('--file', action='append', default=[], help='Relevant local file to ask Gemini to read; repeatable')
     parser.add_argument('--chat-image-message', action='append', default=[], help='Export images from this current-chat user message ID for this call; repeatable')
-    parser.add_argument('--timeout-seconds', type=int, default=600, help='Maximum wait for agy (default: 600 seconds)')
+    parser.add_argument('--timeout-seconds', type=int, default=0, help='Optional explicit maximum wait for agy; default 0 waits until completion')
     dispatch(parser.parse_args())
 
 
@@ -243,7 +320,7 @@ def dispatch(a):
     if not os.path.isdir(root): raise ValueError('Project root is not a directory')
     if not a.thread_id or not UUID.fullmatch(a.thread_id):
         raise ValueError('A valid Codex thread ID is required; automatic fallback is forbidden')
-    if not 30 <= getattr(a, 'timeout_seconds', 600) <= 3600: raise ValueError('Timeout must be between 30 and 3600 seconds')
+    if getattr(a, 'timeout_seconds', 0) != 0 and not 30 <= a.timeout_seconds <= 3600: raise ValueError('Timeout must be 0 or between 30 and 3600 seconds')
     user = Path(a.user_file).read_text(encoding='utf-8-sig')
     context = Path(a.context_file).read_text(encoding='utf-8-sig')
     if not user.strip() or not context.strip(): raise ValueError('User request and context must both be non-empty')
@@ -254,7 +331,7 @@ def dispatch(a):
         if a.independent_id: raise ValueError('Independent phase must start a fresh conversation')
         prompt = ('请独立思考并提出方案；不要使用工具、读取文件或采用其他模型的观点。'
                   '以下背景必须仅包含与问题有关的事实，不含其他模型的方案。\n\n' + common)
-        options = {} if getattr(a, 'timeout_seconds', 600) == 600 else {'timeout_seconds': a.timeout_seconds}
+        options = {} if getattr(a, 'timeout_seconds', 0) == 0 else {'timeout_seconds': a.timeout_seconds}
         with tempfile.TemporaryDirectory(prefix='codex-agy-blind-') as scratch:
             result, _ = run_agy(prompt, scratch, **options)
         with connect() as db:
@@ -269,7 +346,7 @@ def dispatch(a):
         if not a.independent_id or not UUID.fullmatch(a.independent_id):
             raise ValueError('Synthesis requires the independent conversation ID')
         prompt = '请对比并汇总双方已完成的独立方案，保留分歧，独立判断。\n\n' + common
-        options = {} if getattr(a, 'timeout_seconds', 600) == 600 else {'timeout_seconds': a.timeout_seconds}
+        options = {} if getattr(a, 'timeout_seconds', 0) == 0 else {'timeout_seconds': a.timeout_seconds}
         with lock('independent:' + a.independent_id.lower()):
             with connect() as db:
                 row = db.execute('SELECT root,codex_thread_id FROM independent_sessions WHERE conversation_id=?',
@@ -312,7 +389,7 @@ def report(a, root, common, image_dir):
                 '\n请逐项尝试使用读取工具打开文件，说明成功或失败及原因。图片须实际使用能理解图像的工具，'
                 '不得仅凭路径或文件名声称看过内容。临时图片对应本次指定的当前聊天附件。')
         if getattr(a, 'trace', False): options['trace'] = True
-        if getattr(a, 'timeout_seconds', 600) != 600: options['timeout_seconds'] = a.timeout_seconds
+        if getattr(a, 'timeout_seconds', 0) != 0: options['timeout_seconds'] = a.timeout_seconds
         with connect() as db:
             row = db.execute('SELECT agy_conversation_id FROM chats WHERE root=? AND codex_thread_id=?',
                              (root, a.thread_id.lower())).fetchone()

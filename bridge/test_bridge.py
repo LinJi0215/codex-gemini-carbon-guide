@@ -7,8 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
-import subprocess
-from types import SimpleNamespace
+import sys
 import unittest
 from unittest.mock import patch
 import uuid
@@ -21,21 +20,31 @@ class BridgeTests(unittest.TestCase):
             base = Path(directory); f = base/'source.txt'; f.write_text('hello')
             cid = str(uuid.uuid4())
             result = {'event':'result','result':{'status':'SUCCESS','response':'ok','conversation_id':cid}}
-            completed = SimpleNamespace(stdout=json.dumps(result),stderr='',returncode=0)
-            with patch.object(bridge.shutil, 'which', return_value='agy.exe'), patch.object(bridge, 'DATA', base/'data'), patch.object(bridge.subprocess, 'run', return_value=completed) as run:
+            with patch.object(bridge.shutil, 'which', return_value='agy.exe'), patch.object(bridge, 'DATA', base/'data'), patch.object(bridge, 'capture_stream', return_value=([result], '', 0)) as run:
                 bridge.run_agy('question',str(base),read_paths=[str(f)],timeout_seconds=600)
                 args = run.call_args.args[0]
                 permissions = json.loads(args[args.index('--settings')+1])['permissions']
                 self.assertEqual(permissions, {'allow':['read_file('+str(f)+')']})
                 self.assertEqual(args[args.index('--print-timeout')+1], '600s')
-                self.assertEqual(run.call_args.kwargs['timeout'], 630)
+                self.assertEqual(run.call_args.kwargs['timeout_seconds'], 600)
 
     def test_timeout_reports_unknown_remote_state_without_retry(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             base = Path(directory)
-            with patch.object(bridge.shutil, 'which', return_value='agy.exe'), patch.object(bridge, 'DATA', base/'data'), patch.object(bridge.subprocess, 'run', side_effect=subprocess.TimeoutExpired('agy', 30)) as run:
-                with self.assertRaisesRegex(RuntimeError, 'may still be running'): bridge.run_agy('q',str(base),timeout_seconds=30)
-                self.assertEqual(run.call_count, 1)
+            script = 'import time; time.sleep(3)'
+            with self.assertRaisesRegex(RuntimeError, 'may still be running'):
+                bridge.capture_stream([sys.executable, '-u', '-c', script], str(base), '', timeout_seconds=.1, timeout_grace=0, progress_interval=2)
+
+    def test_progress_check_keeps_waiting_for_result(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory); output = io.StringIO()
+            script = 'import json,time; print(json.dumps({"event":"init"}),flush=True); time.sleep(.35); print(json.dumps({"event":"result","result":{"status":"SUCCESS"}}),flush=True)'
+            with patch.object(bridge, 'agy_status', return_value='unknown'), contextlib.redirect_stderr(output):
+                events, _, code = bridge.capture_stream([sys.executable, '-u', '-c', script], str(base), '', progress_interval=.05)
+            self.assertEqual(code, 0)
+            self.assertEqual(events[-1]['result']['status'], 'SUCCESS')
+            self.assertIn('status=unknown', output.getvalue())
+            self.assertIn('continuing to wait', output.getvalue())
 
     def test_scoped_permissions_preserve_existing_ask_and_deny(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:

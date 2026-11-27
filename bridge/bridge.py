@@ -206,7 +206,8 @@ def dispatch(a):
     options = {}
     if getattr(a, 'trace', False): options['trace'] = True
     prompt = ('请基于用户原话与一手事实独立判断后撰写汇报，不要只是改写工作记录；'
-              '区分证据、推断与未知，不得编造。不要修改文件。\n\n' + common)
+              '区分证据、推断与未知，不得编造。带有未同步附件标记的消息中，附件内容未提供，'
+              '不得声称看过，必要时请 Codex 补充。不要修改文件。\n\n' + common)
     with lock('chat:' + root + ':' + a.thread_id.lower()):
         # The Codex client already persists its own messages; no background watcher
         # or model invocation is needed to accumulate them locally.
@@ -240,6 +241,7 @@ def dispatch(a):
                                    [(root, a.thread_id.lower(), i[0]) for i in pending])
         output = {'phase': 'report', 'project_root': root, 'thread_id': a.thread_id.lower(),
                   'conversation_id': result['conversation_id'], 'synced_messages': len(pending),
+                  'omitted_attachment_markers': sum(item[3].count('[未同步的非文本附件: ') for item in pending),
                   'response': result['response'], 'usage': result.get('usage')}
         if getattr(a, 'trace', False): output['tool_trace'] = result.get('_tool_trace', [])
         print(json.dumps(output, ensure_ascii=False))

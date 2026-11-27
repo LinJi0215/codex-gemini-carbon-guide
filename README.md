@@ -242,6 +242,7 @@ python "C:\tools\codex-agy-bridge\bridge\bridge.py" `
 - `conversation_id`：本次使用的 `agy` 会话 UUID。
 - `usage`：`agy` 返回的当前会话累计 token 统计信息（含 `input`、`output`、`thinking`、`cache_read` 等字段，见 [Headless CLI 文档](https://antigravity.google/docs/cli/headless)）。
 - `synced_messages`：`report` 阶段本次成功同步并更新游标的本地历史消息条数。
+- `omitted_attachment_markers`：本次增量中未同步的非文本附件占位数。图片等附件本体不会自动发送，需要时应由 Codex 提供其内容或描述。
 
 ---
 
@@ -255,7 +256,8 @@ python "C:\tools\codex-agy-bridge\bridge\bridge.py" `
    - 只有 `agy` 返回成功后才会更新已同步消息游标；若中途网络或限流失败不会标记成功，下次重试时可能重复发送未落库部分。
 2. **增量读取范围与内部格式依赖**
    - `bridge/history.py` 仅读取当前 `CODEX_THREAD_ID` **已落盘的纯文本用户消息与最终答复**——不保证捕获尚未写盘的进行中消息，不包含工具输出、系统注入指令与中间推理过程，也绝不自动跨会话读取其他聊天。
-   - 遇到图片等非文本附件、会话身份核验不通过、权限不足或记录缺失时，脚本会主动中止并报错说明。
+   - 图片等非文本附件只发送“未同步”的占位说明，不会发送附件本体；需要内容时须由 Codex 补充。会话身份核验不通过、权限不足或记录缺失时，脚本会中止并报错说明。
+   - 用户聊天被移动到其他项目时，以最近一次已保存的 `turn_context.cwd` 判断当前项目，且仍核验聊天 ID 和来源；首次同步可能包含该聊天之前的文本，请先确认允许共享。
    - 历史读取依赖 `~/.codex/sessions` 的客户端内部非公开存储格式，`agy` 项目核对依赖其本地会话索引结构（参考 [Antigravity Projects 文档](https://antigravity.google/docs/projects?tab=cli)）；任一客户端升级调整本地存储格式后，脚本可能需要同步更新。
 3. **目录映射与本地文件读取权限边界**
    - 项目映射以**规范化本地路径**为键（而非抽象项目 ID），同一仓库的不同 Git Worktree 会被视为不同项目分别映射。
@@ -274,8 +276,8 @@ python "C:\tools\codex-agy-bridge\bridge\bridge.py" `
   说明当前窗口是 CMD 而非 PowerShell。请改用 PowerShell 执行，或使用 CMD 对应的安装方式并查阅官方最新文档。
 - **Q2：手动在终端运行 `bridge.py` 提示缺少有效 `thread_id`？**  
   普通终端没有 Codex 会话自动注入的 `CODEX_THREAD_ID` 环境变量。若仅测试独立阶段或指定会话，需显式加上 `--thread-id <合法UUID>`；日常在 Codex 聊天内按 `AGENTS.md` 触发时会自动携带当前会话 ID。
-- **Q3：日常汇报同步时报错中止，提示存在非文本内容或找不到会话记录？**  
-  为防止上下文静默缺失，当前聊天若包含截图/非文本附件，或消息尚未落盘、客户端本地会话格式变更，`history.py` 会停止同步并给出具体原因。可在纯文本会话中使用，或改用不读取日常历史的模式排查。
+- **Q3：日常汇报同步时报错中止，或聊天包含图片怎么办？**
+  身份核验、权限或记录格式出错时，`history.py` 会停止同步并说明原因。图片和其他非文本附件仅以“未同步”占位，不会让 Gemini 看到原内容；若当前任务依赖附件，请由 Codex 单独提供或描述其相关内容。
 - **Q4：第一次在 Codex 里触发桥接时弹出命令执行/联网授权提示？**  
   属于 Codex 沙箱的正常安全机制。核对命令路径确实为你本人克隆的 `bridge/bridge.py` 及本机 `agy` 后，按需授权即可。
 

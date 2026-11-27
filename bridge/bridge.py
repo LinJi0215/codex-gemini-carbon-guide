@@ -109,13 +109,38 @@ def project_id_from_index(conversation_id, root):
     raise RuntimeError('Cannot verify the conversation project in the agy index')
 
 
-def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, trace=False):
+def scoped_read_settings(paths):
+    """Retain existing permission rules while adding exact per-call read grants."""
+    settings_path = Path.home() / '.gemini' / 'antigravity-cli' / 'settings.json'
+    existing = {}
+    if settings_path.is_file():
+        settings = json.loads(settings_path.read_text(encoding='utf-8-sig'))
+        existing = settings.get('permissions', {})
+        if not isinstance(existing, dict): raise ValueError('Invalid agy permissions settings')
+    permissions = dict(existing)
+    allowed = permissions.get('allow', [])
+    if not isinstance(allowed, list): raise ValueError('Invalid agy allow rules')
+    rules = list(allowed)
+    for path in paths:
+        if os.path.isfile(path) and '*' not in path:
+            rule = 'read_file(' + path + ')'
+            if rule not in rules: rules.append(rule)
+    permissions['allow'] = rules
+    return {'permissions': permissions}
+
+
+def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, trace=False, read_paths=None, timeout_seconds=600):
     exe = shutil.which('agy.exe') or shutil.which('agy')
     if not exe:
         raise RuntimeError('agy executable not found')
     make_dir(DATA)
     args = [exe, '--model', 'gemini-4-carbon-medium', '--mode', 'plan',
-            '--input-format', 'stream-json', '--output-format', 'stream-json', '--print-timeout', '180s']
+            '--input-format', 'stream-json', '--output-format', 'stream-json', '--print-timeout', str(timeout_seconds) + 's']
+    if read_paths:
+        # Each --file is an explicit, per-invocation request. Never grant a
+        # directory, wildcard, writes or commands. Existing deny/ask still apply.
+        settings = scoped_read_settings(read_paths)
+        args.extend(['--settings', json.dumps(settings, ensure_ascii=False)])
     if new_project:
         args.append('--new-project')
     if project:
@@ -127,7 +152,10 @@ def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, 
             raise RuntimeError('Stored conversation belongs to a different project; refusing to send')
     try:
         request = json.dumps({'event': 'user', 'message': {'content': prompt}}, ensure_ascii=False) + '\n'
-        p = subprocess.run(args, cwd=cwd, input=request, capture_output=True, encoding='utf-8', errors='replace', timeout=210)
+        try:
+            p = subprocess.run(args, cwd=cwd, input=request, capture_output=True, encoding='utf-8', errors='replace', timeout=timeout_seconds + 30)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('agy client timed out; the remote turn may still be running. No success was recorded; do not automatically retry.')
         try:
             events = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
             result = next(e['result'] for e in reversed(events) if e.get('event') == 'result')
@@ -135,6 +163,8 @@ def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, 
             raise RuntimeError('agy returned no valid JSON; no mapping was saved. ' + p.stderr[-1000:])
         if p.returncode or result.get('status') != 'SUCCESS' or not result.get('response'):
             detail = result.get('error') or ('empty response' if not result.get('response') else result.get('status'))
+            if 'print_timeout' in p.stderr or 'print timeout' in p.stderr:
+                raise RuntimeError('agy print timeout; the turn may still be in progress. No success was recorded; do not automatically retry. ' + p.stderr[-1000:])
             raise RuntimeError('agy failed; no new mapping was saved: ' + str(detail) + ' ' + p.stderr[-1000:])
         cid = result.get('conversation_id', '')
         if not UUID.fullmatch(cid):
@@ -204,6 +234,7 @@ def main():
     parser.add_argument('--trace', action='store_true', help='Include completed tool calls from this turn')
     parser.add_argument('--file', action='append', default=[], help='Relevant local file to ask Gemini to read; repeatable')
     parser.add_argument('--chat-image-message', action='append', default=[], help='Export images from this current-chat user message ID for this call; repeatable')
+    parser.add_argument('--timeout-seconds', type=int, default=600, help='Maximum wait for agy (default: 600 seconds)')
     dispatch(parser.parse_args())
 
 
@@ -212,6 +243,7 @@ def dispatch(a):
     if not os.path.isdir(root): raise ValueError('Project root is not a directory')
     if not a.thread_id or not UUID.fullmatch(a.thread_id):
         raise ValueError('A valid Codex thread ID is required; automatic fallback is forbidden')
+    if not 30 <= getattr(a, 'timeout_seconds', 600) <= 3600: raise ValueError('Timeout must be between 30 and 3600 seconds')
     user = Path(a.user_file).read_text(encoding='utf-8-sig')
     context = Path(a.context_file).read_text(encoding='utf-8-sig')
     if not user.strip() or not context.strip(): raise ValueError('User request and context must both be non-empty')
@@ -222,8 +254,9 @@ def dispatch(a):
         if a.independent_id: raise ValueError('Independent phase must start a fresh conversation')
         prompt = ('请独立思考并提出方案；不要使用工具、读取文件或采用其他模型的观点。'
                   '以下背景必须仅包含与问题有关的事实，不含其他模型的方案。\n\n' + common)
+        options = {} if getattr(a, 'timeout_seconds', 600) == 600 else {'timeout_seconds': a.timeout_seconds}
         with tempfile.TemporaryDirectory(prefix='codex-agy-blind-') as scratch:
-            result, _ = run_agy(prompt, scratch)
+            result, _ = run_agy(prompt, scratch, **options)
         with connect() as db:
             db.execute('INSERT INTO independent_sessions VALUES (?,?,?)',
                        (result['conversation_id'], root, a.thread_id.lower()))
@@ -236,13 +269,14 @@ def dispatch(a):
         if not a.independent_id or not UUID.fullmatch(a.independent_id):
             raise ValueError('Synthesis requires the independent conversation ID')
         prompt = '请对比并汇总双方已完成的独立方案，保留分歧，独立判断。\n\n' + common
+        options = {} if getattr(a, 'timeout_seconds', 600) == 600 else {'timeout_seconds': a.timeout_seconds}
         with lock('independent:' + a.independent_id.lower()):
             with connect() as db:
                 row = db.execute('SELECT root,codex_thread_id FROM independent_sessions WHERE conversation_id=?',
                                  (a.independent_id,)).fetchone()
             if not row or row != (root, a.thread_id.lower()):
                 raise RuntimeError('Independent conversation is not registered to this project and Codex chat')
-            result, _ = run_agy(prompt, root, conversation=a.independent_id)
+            result, _ = run_agy(prompt, root, conversation=a.independent_id, **options)
         print(json.dumps({'phase': 'synthesis', 'conversation_id': result['conversation_id'],
                           'response': result['response']}, ensure_ascii=False))
         return
@@ -273,10 +307,12 @@ def report(a, root, common, image_dir):
             items = history.messages(root, a.thread_id)
         if paths:
             options['trace'] = True
+            options['read_paths'] = paths
             prompt += ('\n\n【本次需要读取的本地文件】\n' + '\n'.join(paths) +
                 '\n请逐项尝试使用读取工具打开文件，说明成功或失败及原因。图片须实际使用能理解图像的工具，'
                 '不得仅凭路径或文件名声称看过内容。临时图片对应本次指定的当前聊天附件。')
         if getattr(a, 'trace', False): options['trace'] = True
+        if getattr(a, 'timeout_seconds', 600) != 600: options['timeout_seconds'] = a.timeout_seconds
         with connect() as db:
             row = db.execute('SELECT agy_conversation_id FROM chats WHERE root=? AND codex_thread_id=?',
                              (root, a.thread_id.lower())).fetchone()

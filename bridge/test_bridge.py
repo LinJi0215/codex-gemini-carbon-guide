@@ -2,10 +2,13 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
 import time
+import subprocess
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
@@ -13,6 +16,37 @@ import bridge
 
 
 class BridgeTests(unittest.TestCase):
+    def test_per_call_read_scope_and_timeout_are_explicit(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory); f = base/'source.txt'; f.write_text('hello')
+            cid = str(uuid.uuid4())
+            result = {'event':'result','result':{'status':'SUCCESS','response':'ok','conversation_id':cid}}
+            completed = SimpleNamespace(stdout=json.dumps(result),stderr='',returncode=0)
+            with patch.object(bridge.shutil, 'which', return_value='agy.exe'), patch.object(bridge, 'DATA', base/'data'), patch.object(bridge.subprocess, 'run', return_value=completed) as run:
+                bridge.run_agy('question',str(base),read_paths=[str(f)],timeout_seconds=600)
+                args = run.call_args.args[0]
+                permissions = json.loads(args[args.index('--settings')+1])['permissions']
+                self.assertEqual(permissions, {'allow':['read_file('+str(f)+')']})
+                self.assertEqual(args[args.index('--print-timeout')+1], '600s')
+                self.assertEqual(run.call_args.kwargs['timeout'], 630)
+
+    def test_timeout_reports_unknown_remote_state_without_retry(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory)
+            with patch.object(bridge.shutil, 'which', return_value='agy.exe'), patch.object(bridge, 'DATA', base/'data'), patch.object(bridge.subprocess, 'run', side_effect=subprocess.TimeoutExpired('agy', 30)) as run:
+                with self.assertRaisesRegex(RuntimeError, 'may still be running'): bridge.run_agy('q',str(base),timeout_seconds=30)
+                self.assertEqual(run.call_count, 1)
+
+    def test_scoped_permissions_preserve_existing_ask_and_deny(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory); f = base/'source.txt'; f.write_text('hello')
+            cfg = base/'.gemini'/'antigravity-cli'; cfg.mkdir(parents=True)
+            (cfg/'settings.json').write_text(json.dumps({'permissions': {'allow':['read_file(existing)'], 'ask':['read_file(ask)'], 'deny':['read_file(denied)']}}))
+            with patch.object(bridge.Path, 'home', return_value=base): settings = bridge.scoped_read_settings([str(f)])
+            self.assertEqual(settings['permissions']['ask'], ['read_file(ask)'])
+            self.assertEqual(settings['permissions']['deny'], ['read_file(denied)'])
+            self.assertEqual(settings['permissions']['allow'], ['read_file(existing)', 'read_file('+str(f)+')'])
+
     def test_file_status_requires_matching_successful_read_tool(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             base = Path(directory)

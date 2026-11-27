@@ -1,4 +1,5 @@
 import json
+import base64
 import os
 from pathlib import Path
 import tempfile
@@ -9,6 +10,20 @@ import history
 
 
 class HistoryTests(unittest.TestCase):
+    def test_export_only_selected_current_chat_images_after_identity_validation(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
+            root = Path(tmp); tid = str(uuid.uuid4()); image_dir = root/'images'; image_dir.mkdir()
+            path = root / ('rollout-2026-01-01T00-00-00-' + tid + '.jsonl')
+            def entry(typ, payload): return json.dumps({'type':typ,'payload':payload})+'\n'
+            data = base64.b64encode(b'test image').decode()
+            path.write_text(entry('session_meta', {'id':tid,'cwd':str(root),'thread_source':'user'}) +
+                entry('response_item', {'type':'message','id':'img','role':'user','content':[{'type':'input_image','image_url':'data:image/png;base64,'+data}]}), encoding='utf-8')
+            with patch.dict(os.environ, {'CODEX_THREAD_ID':tid}):
+                history.messages(str(root), tid, root, ['img'], image_dir)
+                self.assertEqual([p.read_bytes() for p in image_dir.iterdir()], [b'test image'])
+                with self.assertRaises(ValueError): history.messages(str(root), tid, root, ['other'], image_dir)
+                with self.assertRaises(RuntimeError): history.messages(str(root/'wrong'), tid, root, ['img'], image_dir)
+
     def test_only_current_identity_and_user_facing_messages(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
             root = Path(tmp)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit Codex-to-agy project/session mapping. No transcript harvesting."""
+"""Codex-to-agy mapping with on-demand current-chat synchronization."""
 import argparse
 import contextlib
 import hashlib
@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -153,6 +154,45 @@ def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, 
         pass
 
 
+def file_statuses(paths, trace, root):
+    """Match completed read tool calls to requested paths; never trust prose alone."""
+    reads = {'read_file', 'view_file', 'view_image', 'read_image'}
+    result = []
+    for path in paths:
+        status = 'not_confirmed'
+        try:
+            metadata = os.stat(path)
+            if not stat.S_ISREG(metadata.st_mode): status = 'not_a_file'
+        except FileNotFoundError:
+            status = 'not_found'
+        except PermissionError:
+            status = 'local_permission_denied'
+        except OSError:
+            status = 'local_error'
+        for step in trace:
+            info = step.get('tool_info') or {}
+            name = info.get('name') or step.get('tool_name') or ''
+            if name not in reads: continue
+            params = info.get('parameters') or {}
+            if isinstance(params, str):
+                try: params = json.loads(params)
+                except ValueError: continue
+            if not isinstance(params, dict): continue
+            target = next((v for k, v in params.items() if k.lower() in ('path', 'file_path', 'filepath', 'absolute_path') and isinstance(v, str)), None)
+            if not target: continue
+            target = target if os.path.isabs(target) else os.path.join(root, target)
+            if canonical(target) != canonical(path): continue
+            detail = str(info.get('error') or info.get('output') or '').lower()
+            if info.get('error') or any(x in detail for x in ('permission denied', 'access denied', 'not allowed', '拒绝访问', '权限不足', 'file not found', 'no such file', 'unsupported format', 'error reading', 'failed to read')):
+                status = 'read_failed'
+            elif info.get('output'):
+                status = 'read_tool_succeeded'
+            elif status == 'not_confirmed':
+                status = 'read_tool_completed_unconfirmed'
+        result.append({'path': path, 'status': status})
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description='Map one Codex chat to one agy conversation.')
     parser.add_argument('--root', default=os.getcwd())
@@ -162,6 +202,8 @@ def main():
     parser.add_argument('--context-file', required=True, help='UTF-8 file containing relevant evidence and background')
     parser.add_argument('--independent-id', help='agy independent conversation ID, for synthesis only')
     parser.add_argument('--trace', action='store_true', help='Include completed tool calls from this turn')
+    parser.add_argument('--file', action='append', default=[], help='Relevant local file to ask Gemini to read; repeatable')
+    parser.add_argument('--chat-image-message', action='append', default=[], help='Export images from this current-chat user message ID for this call; repeatable')
     dispatch(parser.parse_args())
 
 
@@ -175,6 +217,7 @@ def dispatch(a):
     if not user.strip() or not context.strip(): raise ValueError('User request and context must both be non-empty')
     common = '【用户完整原始指令】\n' + user + '\n\n【相关背景与事实】\n' + context
     if a.phase == 'independent':
+        if getattr(a, 'file', []) or getattr(a, 'chat_image_message', []): raise ValueError('Independent mode does not accept files or chat images')
         if getattr(a, 'trace', False): raise ValueError('Independent mode does not support tool tracing')
         if a.independent_id: raise ValueError('Independent phase must start a fresh conversation')
         prompt = ('请独立思考并提出方案；不要使用工具、读取文件或采用其他模型的观点。'
@@ -188,6 +231,7 @@ def dispatch(a):
                           'response': result['response']}, ensure_ascii=False))
         return
     if a.phase == 'synthesis':
+        if getattr(a, 'file', []) or getattr(a, 'chat_image_message', []): raise ValueError('Synthesis mode does not accept files or chat images')
         if getattr(a, 'trace', False): raise ValueError('Synthesis mode does not support tool tracing')
         if not a.independent_id or not UUID.fullmatch(a.independent_id):
             raise ValueError('Synthesis requires the independent conversation ID')
@@ -203,15 +247,36 @@ def dispatch(a):
                           'response': result['response']}, ensure_ascii=False))
         return
     if a.independent_id: raise ValueError('Report mode cannot use an independent conversation')
+    with contextlib.ExitStack() as stack:
+        image_dir = None
+        if getattr(a, 'chat_image_message', []):
+            image_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix='.codex-agy-images-', dir=root))
+        report(a, root, common, image_dir)
+
+
+def report(a, root, common, image_dir):
     options = {}
-    if getattr(a, 'trace', False): options['trace'] = True
+    paths = []
+    for raw in getattr(a, 'file', []):
+        path = canonical(raw if os.path.isabs(raw) else os.path.join(root, raw))
+        if path not in paths: paths.append(path)
     prompt = ('请基于用户原话与一手事实独立判断后撰写汇报，不要只是改写工作记录；'
               '区分证据、推断与未知，不得编造。带有未同步附件标记的消息中，附件内容未提供，'
               '不得声称看过，必要时请 Codex 补充。不要修改文件。\n\n' + common)
     with lock('chat:' + root + ':' + a.thread_id.lower()):
         # The Codex client already persists its own messages; no background watcher
         # or model invocation is needed to accumulate them locally.
-        items = history.messages(root, a.thread_id)
+        if image_dir:
+            items = history.messages(root, a.thread_id, image_messages=a.chat_image_message, image_dir=image_dir)
+            paths.extend(str(x) for x in sorted(Path(image_dir).iterdir()))
+        else:
+            items = history.messages(root, a.thread_id)
+        if paths:
+            options['trace'] = True
+            prompt += ('\n\n【本次需要读取的本地文件】\n' + '\n'.join(paths) +
+                '\n请逐项尝试使用读取工具打开文件，说明成功或失败及原因。图片须实际使用能理解图像的工具，'
+                '不得仅凭路径或文件名声称看过内容。临时图片对应本次指定的当前聊天附件。')
+        if getattr(a, 'trace', False): options['trace'] = True
         with connect() as db:
             row = db.execute('SELECT agy_conversation_id FROM chats WHERE root=? AND codex_thread_id=?',
                              (root, a.thread_id.lower())).fetchone()
@@ -243,6 +308,7 @@ def dispatch(a):
                   'conversation_id': result['conversation_id'], 'synced_messages': len(pending),
                   'omitted_attachment_markers': sum(item[3].count('[未同步的非文本附件: ') for item in pending),
                   'response': result['response'], 'usage': result.get('usage')}
+        if paths: output['file_status'] = file_statuses(paths, result.get('_tool_trace', []), root)
         if getattr(a, 'trace', False): output['tool_trace'] = result.get('_tool_trace', [])
         print(json.dumps(output, ensure_ascii=False))
 

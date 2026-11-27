@@ -12,6 +12,7 @@
 2. **本地对话按需增量同步**：新增 `bridge/history.py`，复用本机已落盘的当前聊天记录，在需要 Gemini 协作时通过 `stream-json` 标准输入一次性补齐未同步的纯文本问答增量，无需后台常驻进程，也不必每发一条消息都调用模型。
 3. **双模型商讨两阶段物理分流**：拆分为 `--phase independent`（全新会话 + 临时目录，不传 Codex 观点、不读日常增量）与 `--phase synthesis`（校验同项目同聊天归属后对比汇总）。
 4. **独立撰稿与严谨边界校正**：更新全局 `AGENTS.md` 模板（要求传入用户完整原话与一手事实供 Gemini 独立判断，再由 Codex 复核事实）；修正了初版教程中关于跨端额度池绝对分离、必须强制重启客户端等缺乏官方稳定依据的表述。
+5. **文件与图片读取确认**：按需传递本地文件路径；可从当前聊天指定消息临时还原内嵌图片，并根据实际工具记录逐项返回读取状态。图片理解能力仍需另行核验。
 
 ---
 
@@ -186,6 +187,9 @@ python -m unittest discover -s bridge -p "test_*.py" -v
 - **Codex 撰写**：简单问答、进度同步或规则确认等由 Codex 直接撰写。
 - **Gemini 未调用成功**：如实说明报错或限流原因，未经确认不静默切换模型。
 - 若用户同意临时切换到其他模型，应如实说明实际模型，不能标注为 Carbon。
+
+## 规则 5：需要读取的本地文件与图片
+日常汇报中，按需使用 `--file` 传入允许共享的本地文件路径，或使用 `--chat-image-message` 指定当前聊天中需要的图片消息。核对返回的 `file_status`，不要仅凭路径或模型自述认定读取成功；读取工具的结果也不保证内容完整或正确理解。图片临时文件正常结束后删除，异常终止可能遗留。独立思考首轮不传文件路径和附件，始终遵守项目隐私和云端共享限制。
 ```
 
 当前桥接脚本固定调用 `gemini-4-carbon-medium`，不提供切换模型的参数。模板中的高思考等级或 Neon 是需要另行调整调用方式才能使用的选项，不会自动切换。
@@ -205,6 +209,8 @@ python -m unittest discover -s bridge -p "test_*.py" -v
 - `--independent-id <UUID>`：仅在 `--phase synthesis` 时必填，传入当前项目、当前聊天在 `independent` 阶段返回的 `conversation_id`。
 - `--thread-id <UUID>`：在 Codex 会话内部运行时，环境可能提供 `CODEX_THREAD_ID`；若变量缺失可显式提供 `--thread-id`。日常 `report` 模式的历史读取还要求环境变量 `CODEX_THREAD_ID` 存在，且与指定 ID 相同；仅传 `--thread-id` 并不足以在普通外部终端启用历史同步。
 - `--trace`（可选）：在返回结果中附带工具调用轨迹。**注意：`--trace` 输出可能包含本机敏感路径与工具读取片段，公开贴出日志前请务必脱敏。**
+- `--file <文件路径>`（可重复，日常汇报）：传递本次需要读取的本地文件路径，并返回对应的工具读取状态。
+- `--chat-image-message <消息ID>`（可重复，日常汇报）：按消息 ID 临时还原当前聊天中的指定用户消息内嵌图片，供本次读取；需先从当前聊天记录定位 ID。
 
 ### 2. 三种模式调用示例
 
@@ -242,7 +248,8 @@ python "C:\tools\codex-agy-bridge\bridge\bridge.py" `
 - `conversation_id`：本次使用的 `agy` 会话 UUID。
 - `usage`：`agy` 返回的当前会话累计 token 统计信息（含 `input`、`output`、`thinking`、`cache_read` 等字段，见 [Headless CLI 文档](https://antigravity.google/docs/cli/headless)）。
 - `synced_messages`：`report` 阶段本次成功同步并更新游标的本地历史消息条数。
-- `omitted_attachment_markers`：本次增量中未同步的非文本附件占位数。图片等附件本体不会自动发送，需要时应由 Codex 提供其内容或描述。
+- `omitted_attachment_markers`：本次增量中未同步的非文本附件占位数；手动指定还原图片后，历史文本里的占位数仍会保留，需结合 `file_status` 判断本次实际文件读取。
+- `file_status`：`read_tool_succeeded` 表示对应读取工具完成且有输出；`read_tool_completed_unconfirmed` 表示工具完成但输出不足以确认；`read_failed` 为工具报错；`not_found` 为本地文件不存在；`not_confirmed` 为没有匹配工具记录。另有 `local_permission_denied`、`not_a_file`、`local_error` 等本机检查状态。以上状态不证明模型完整理解文件内容。
 
 ---
 
@@ -256,7 +263,7 @@ python "C:\tools\codex-agy-bridge\bridge\bridge.py" `
    - 只有 `agy` 返回成功后才会更新已同步消息游标；若中途网络或限流失败不会标记成功，下次重试时可能重复发送未落库部分。
 2. **增量读取范围与内部格式依赖**
    - `bridge/history.py` 仅读取当前 `CODEX_THREAD_ID` **已落盘的纯文本用户消息与最终答复**——不保证捕获尚未写盘的进行中消息，不包含工具输出、系统注入指令与中间推理过程，也绝不自动跨会话读取其他聊天。
-   - 图片等非文本附件只发送“未同步”的占位说明，不会发送附件本体；需要内容时须由 Codex 补充。会话身份核验不通过、权限不足或记录缺失时，脚本会中止并报错说明。
+   - 图片等非文本附件的增量消息仍以占位符表示；需要图片时，可由 Codex 传现有文件路径或使用 `--chat-image-message` 按需还原当前聊天中指定消息的内嵌图片。临时图片正常调用结束后删除，异常终止可能留下文件。其他无法恢复的附件需要另行提供。会话身份核验不通过、权限不足或记录缺失时，脚本会中止并报错说明。
    - 用户聊天被移动到其他项目时，以最近一次已保存的 `turn_context.cwd` 判断当前项目，且仍核验聊天 ID 和来源；首次同步可能包含该聊天之前的文本，请先确认允许共享。
    - 历史读取依赖 `~/.codex/sessions` 的客户端内部非公开存储格式，`agy` 项目核对依赖其本地会话索引结构（参考 [Antigravity Projects 文档](https://antigravity.google/docs/projects?tab=cli)）；任一客户端升级调整本地存储格式后，脚本可能需要同步更新。
 3. **目录映射与本地文件读取权限边界**
@@ -277,7 +284,7 @@ python "C:\tools\codex-agy-bridge\bridge\bridge.py" `
 - **Q2：手动在终端运行 `bridge.py` 提示缺少有效 `thread_id`？**  
   普通终端没有 Codex 会话自动注入的 `CODEX_THREAD_ID` 环境变量。若仅测试独立阶段或指定会话，需显式加上 `--thread-id <合法UUID>`；日常在 Codex 聊天内按 `AGENTS.md` 触发时会自动携带当前会话 ID。
 - **Q3：日常汇报同步时报错中止，或聊天包含图片怎么办？**
-  身份核验、权限或记录格式出错时，`history.py` 会停止同步并说明原因。图片和其他非文本附件仅以“未同步”占位，不会让 Gemini 看到原内容；若当前任务依赖附件，请由 Codex 单独提供或描述其相关内容。
+  身份核验、权限或记录格式出错时，`history.py` 会停止同步并说明原因。附件默认只显示占位；需要时指定文件路径或当前聊天的图片消息，并核对 `file_status`。文件路径和模型自述不代表已读到内容；图片是否被正确识别需单独核验。
 - **Q4：第一次在 Codex 里触发桥接时弹出命令执行/联网授权提示？**  
   属于 Codex 沙箱的正常安全机制。核对命令路径确实为你本人克隆的 `bridge/bridge.py` 及本机 `agy` 后，按需授权即可。
 

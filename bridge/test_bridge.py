@@ -13,6 +13,30 @@ import bridge
 
 
 class BridgeTests(unittest.TestCase):
+    def test_file_status_requires_matching_successful_read_tool(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory)
+            first = base/'first.txt'; second = base/'second.txt'
+            first.write_text('test'); second.write_text('test')
+            trace = [
+                {'tool_name':'read_file','tool_info':{'parameters':{'Path':str(first)},'output':'1 lines, 4 bytes'}},
+                {'tool_name':'read_file','tool_info':{'parameters':{'Path':str(second)},'error':'permission denied'}},
+                {'tool_name':'list_files','tool_info':{'parameters':{'Path':str(second)},'output':'found'}},
+            ]
+            statuses = bridge.file_statuses([str(first), str(second), str(base/'missing')], trace, str(base))
+            self.assertEqual([x['status'] for x in statuses], ['read_tool_succeeded','read_failed','not_found'])
+            self.assertEqual(bridge.file_statuses([str(first)], [], str(base))[0]['status'], 'not_confirmed')
+            no_output = [{'tool_name':'read_file','tool_info':{'parameters':{'Path':str(first)}}}]
+            self.assertEqual(bridge.file_statuses([str(first)], no_output, str(base))[0]['status'], 'read_tool_completed_unconfirmed')
+
+    def test_independent_rejects_attachments(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory)
+            (base/'u').write_text('q'); (base/'c').write_text('facts')
+            args = argparse.Namespace(root=str(base), thread_id=str(uuid.uuid4()), phase='independent',
+                user_file=str(base/'u'), context_file=str(base/'c'), independent_id=None, file=['x'])
+            with self.assertRaises(ValueError): bridge.dispatch(args)
+
     def test_concurrent_chats_and_resume_are_isolated(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             base = Path(directory)

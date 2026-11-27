@@ -4,6 +4,9 @@ The rollout format is an implementation detail: validate identity and fail close
 Never scan the content of other chats. No model calls or background process here.
 """
 import json
+import base64
+import binascii
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -16,7 +19,7 @@ def canonical(path):
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
-def messages(root, thread_id, sessions_dir=None):
+def messages(root, thread_id, sessions_dir=None, image_messages=None, image_dir=None):
     current = os.environ.get('CODEX_THREAD_ID', '')
     if not ID.fullmatch(thread_id) or thread_id.lower() != current.lower():
         raise ValueError('History can only be read for the current Codex chat')
@@ -27,6 +30,8 @@ def messages(root, thread_id, sessions_dir=None):
     if not candidates:
         raise RuntimeError('No local history found for the current chat')
     found = {}
+    selected_images = {}
+    image_messages = set(image_messages or [])
     last_meta_cwd = None
     last_turn_cwd = None
     for path in candidates:
@@ -53,6 +58,8 @@ def messages(root, thread_id, sessions_dir=None):
                 mid = p.get('id')
                 if not isinstance(mid, str) or not mid: raise RuntimeError('History message lacks stable ID')
                 blocks = p.get('content') or []
+                if role == 'user' and mid in image_messages:
+                    selected_images[mid] = [b.get('image_url', '') for b in blocks if b.get('type') == 'input_image']
                 text = []
                 for block in blocks:
                     if block.get('type') in ('input_text', 'output_text'):
@@ -78,4 +85,18 @@ def messages(root, thread_id, sessions_dir=None):
         in_root = False
     if not in_root:
         raise RuntimeError('Session identity or directory is inconsistent; history sync stopped')
+    if image_messages:
+        if image_dir is None: raise ValueError('A temporary image directory is required')
+        if set(selected_images) != image_messages: raise ValueError('Selected image message not found in current chat')
+        for mid, urls in selected_images.items():
+            if not urls: raise ValueError('Selected message has no images')
+            for index, url in enumerate(urls):
+                match = re.fullmatch(r'data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/=]+)', url)
+                if not match: raise ValueError('Selected image is not a supported embedded data URI')
+                try: data = base64.b64decode(match.group(2), validate=True)
+                except binascii.Error: raise ValueError('Invalid embedded image data')
+                if not data or len(data) > 20 * 1024 * 1024: raise ValueError('Embedded image is empty or larger than 20 MB')
+                extension = 'jpg' if match.group(1) == 'jpeg' else match.group(1)
+                name = hashlib.sha256(mid.encode('utf-8')).hexdigest()[:16] + '-' + str(index) + '.' + extension
+                (Path(image_dir) / name).write_bytes(data)
     return [(mid, *found[mid]) for mid in sorted(found, key=lambda i: (found[i][0], i))]

@@ -15,6 +15,44 @@ import bridge
 
 
 class BridgeTests(unittest.TestCase):
+    def test_vetted_directory_grants_and_read_evidence(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory); share = base/'share'; share.mkdir()
+            inside = share/'a.txt'; outside = base/'other.txt'
+            inside.write_text('inside'); outside.write_text('outside')
+            path = bridge.validate_read_directory(str(share), str(base))
+            settings = bridge.scoped_read_settings([], [path])
+            self.assertIn('read_file('+path+')', settings['permissions']['allow'])
+            trace = [{'tool_name':'read_file','tool_info':{'parameters':{'Path':str(f)},'output':'1 line'}} for f in (inside,outside)]
+            status = bridge.directory_statuses([path], trace, str(base))
+            self.assertEqual(len(status[0]['file_status']), 1)
+            self.assertEqual(status[0]['file_status'][0]['path'], bridge.canonical(inside))
+            self.assertEqual(status[0]['file_status'][0]['status'], 'read_tool_succeeded')
+            self.assertEqual(bridge.directory_statuses([path], [], str(base))[0]['file_status'], [])
+            with self.assertRaises(ValueError): bridge.validate_read_directory(str(Path.home()), str(base))
+
+    def test_independent_rejects_read_directory(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory); (base/'u').write_text('q'); (base/'c').write_text('facts')
+            args = argparse.Namespace(root=str(base),thread_id=str(uuid.uuid4()),phase='independent',
+                user_file=str(base/'u'),context_file=str(base/'c'),independent_id=None,read_dir=[str(base)])
+            with self.assertRaisesRegex(ValueError, 'Independent mode'): bridge.dispatch(args)
+
+    def test_report_passes_directory_grant_and_reports_file_reads(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            base = Path(directory); share = base/'share'; share.mkdir()
+            (base/'u').write_text('question'); (base/'c').write_text('facts')
+            f = share/'record.txt'; f.write_text('record')
+            cid = str(uuid.uuid4()); pid = str(uuid.uuid4())
+            args = argparse.Namespace(root=str(base), thread_id=str(uuid.uuid4()), phase='report',
+                user_file=str(base/'u'),context_file=str(base/'c'),independent_id=None,read_dir=[str(share)])
+            trace = [{'tool_name':'read_file','tool_info':{'parameters':{'Path':str(f)},'output':'1 line'}}]
+            output = io.StringIO()
+            with patch.object(bridge, 'DATA', base/'data'), patch.object(bridge, 'DB', base/'data'/'mapping.sqlite3'), patch.object(bridge.history, 'messages', return_value=[]), patch.object(bridge, 'run_agy', return_value=({'conversation_id':cid,'response':'ok','_tool_trace':trace},pid)) as call, contextlib.redirect_stdout(output):
+                bridge.dispatch(args)
+            self.assertEqual(call.call_args.kwargs['read_dirs'], [bridge.canonical(share)])
+            self.assertEqual(json.loads(output.getvalue())['directory_status'][0]['file_status'][0]['status'], 'read_tool_succeeded')
+
     def test_per_call_read_scope_and_timeout_are_explicit(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             base = Path(directory); f = base/'source.txt'; f.write_text('hello')

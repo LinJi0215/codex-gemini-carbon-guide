@@ -111,8 +111,8 @@ def project_id_from_index(conversation_id, root):
     raise RuntimeError('Cannot verify the conversation project in the agy index')
 
 
-def scoped_read_settings(paths):
-    """Retain existing permission rules while adding exact per-call read grants."""
+def scoped_read_settings(paths, directories=()):
+    """Retain existing rules while adding per-call file and vetted directory grants."""
     settings_path = Path.home() / '.gemini' / 'antigravity-cli' / 'settings.json'
     existing = {}
     if settings_path.is_file():
@@ -125,6 +125,10 @@ def scoped_read_settings(paths):
     rules = list(allowed)
     for path in paths:
         if os.path.isfile(path) and '*' not in path:
+            rule = 'read_file(' + path + ')'
+            if rule not in rules: rules.append(rule)
+    for path in directories:
+        if os.path.isdir(path) and '*' not in path:
             rule = 'read_file(' + path + ')'
             if rule not in rules: rules.append(rule)
     permissions['allow'] = rules
@@ -210,17 +214,16 @@ def capture_stream(args, cwd, request, *, timeout_seconds=0, progress_interval=1
     return events, ''.join(stderr_parts)[-8000:], proc.wait()
 
 
-def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, trace=False, read_paths=None, timeout_seconds=0):
+def run_agy(prompt, cwd, project=None, conversation=None, new_project=False, *, trace=False, read_paths=None, read_dirs=None, timeout_seconds=0):
     exe = shutil.which('agy.exe') or shutil.which('agy')
     if not exe:
         raise RuntimeError('agy executable not found')
     make_dir(DATA)
     args = [exe, '--model', 'gemini-4-carbon-medium', '--mode', 'plan',
             '--input-format', 'stream-json', '--output-format', 'stream-json', '--print-timeout', str(timeout_seconds) + 's']
-    if read_paths:
-        # Each --file is an explicit, per-invocation request. Never grant a
-        # directory, wildcard, writes or commands. Existing deny/ask still apply.
-        settings = scoped_read_settings(read_paths)
+    if read_paths or read_dirs:
+        # Only caller-selected files and vetted directories; existing deny/ask apply.
+        settings = scoped_read_settings(read_paths or [], read_dirs or [])
         args.extend(['--settings', json.dumps(settings, ensure_ascii=False)])
     if new_project:
         args.append('--new-project')
@@ -300,6 +303,44 @@ def file_statuses(paths, trace, root):
     return result
 
 
+def validate_read_directory(raw, root):
+    path = canonical(raw if os.path.isabs(raw) else os.path.join(root, raw))
+    if not os.path.isdir(path) or '*' in path: raise ValueError('Read directory must be an existing directory')
+    home = Path.home()
+    protected = [home/'.codex', home/'.gemini', home/'.ssh']
+    for item in protected:
+        target = canonical(item)
+        try:
+            common = os.path.commonpath([path, target])
+        except ValueError:
+            continue
+        if common in (path, target):
+            raise ValueError('Read directory overlaps a protected or overly broad location')
+    return path
+
+
+def directory_statuses(directories, trace, root):
+    result = []
+    for directory in directories:
+        targets = []
+        for step in trace:
+            info = step.get('tool_info') or {}
+            if (info.get('name') or step.get('tool_name')) not in {'read_file', 'view_file', 'view_image', 'read_image'}: continue
+            params = info.get('parameters') or {}
+            if isinstance(params, str):
+                try: params = json.loads(params)
+                except ValueError: continue
+            if not isinstance(params, dict): continue
+            target = next((v for k, v in params.items() if k.lower() in ('path', 'file_path', 'filepath', 'absolute_path') and isinstance(v, str)), None)
+            if not target: continue
+            target = canonical(target if os.path.isabs(target) else os.path.join(root, target))
+            try: contained = os.path.commonpath([directory, target]) == directory
+            except ValueError: contained = False
+            if contained and target not in targets: targets.append(target)
+        result.append({'directory': directory, 'file_status': file_statuses(targets, trace, root)})
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description='Map one Codex chat to one agy conversation.')
     parser.add_argument('--root', default=os.getcwd())
@@ -310,6 +351,7 @@ def main():
     parser.add_argument('--independent-id', help='agy independent conversation ID, for synthesis only')
     parser.add_argument('--trace', action='store_true', help='Include completed tool calls from this turn')
     parser.add_argument('--file', action='append', default=[], help='Relevant local file to ask Gemini to read; repeatable')
+    parser.add_argument('--read-dir', action='append', default=[], help='Per-call read permission for a vetted task directory; repeatable')
     parser.add_argument('--chat-image-message', action='append', default=[], help='Export images from this current-chat user message ID for this call; repeatable')
     parser.add_argument('--timeout-seconds', type=int, default=0, help='Optional explicit maximum wait for agy; default 0 waits until completion')
     dispatch(parser.parse_args())
@@ -326,7 +368,7 @@ def dispatch(a):
     if not user.strip() or not context.strip(): raise ValueError('User request and context must both be non-empty')
     common = '【用户完整原始指令】\n' + user + '\n\n【相关背景与事实】\n' + context
     if a.phase == 'independent':
-        if getattr(a, 'file', []) or getattr(a, 'chat_image_message', []): raise ValueError('Independent mode does not accept files or chat images')
+        if getattr(a, 'file', []) or getattr(a, 'chat_image_message', []) or getattr(a, 'read_dir', []): raise ValueError('Independent mode does not accept files, directories or chat images')
         if getattr(a, 'trace', False): raise ValueError('Independent mode does not support tool tracing')
         if a.independent_id: raise ValueError('Independent phase must start a fresh conversation')
         prompt = ('请独立思考并提出方案；不要使用工具、读取文件或采用其他模型的观点。'
@@ -341,7 +383,7 @@ def dispatch(a):
                           'response': result['response']}, ensure_ascii=False))
         return
     if a.phase == 'synthesis':
-        if getattr(a, 'file', []) or getattr(a, 'chat_image_message', []): raise ValueError('Synthesis mode does not accept files or chat images')
+        if getattr(a, 'file', []) or getattr(a, 'chat_image_message', []) or getattr(a, 'read_dir', []): raise ValueError('Synthesis mode does not accept files, directories or chat images')
         if getattr(a, 'trace', False): raise ValueError('Synthesis mode does not support tool tracing')
         if not a.independent_id or not UUID.fullmatch(a.independent_id):
             raise ValueError('Synthesis requires the independent conversation ID')
@@ -368,6 +410,7 @@ def dispatch(a):
 def report(a, root, common, image_dir):
     options = {}
     paths = []
+    directories = list(dict.fromkeys(validate_read_directory(raw, root) for raw in getattr(a, 'read_dir', [])))
     for raw in getattr(a, 'file', []):
         path = canonical(raw if os.path.isabs(raw) else os.path.join(root, raw))
         if path not in paths: paths.append(path)
@@ -382,12 +425,17 @@ def report(a, root, common, image_dir):
             paths.extend(str(x) for x in sorted(Path(image_dir).iterdir()))
         else:
             items = history.messages(root, a.thread_id)
-        if paths:
+        if paths or directories:
             options['trace'] = True
-            options['read_paths'] = paths
-            prompt += ('\n\n【本次需要读取的本地文件】\n' + '\n'.join(paths) +
-                '\n请逐项尝试使用读取工具打开文件，说明成功或失败及原因。图片须实际使用能理解图像的工具，'
-                '不得仅凭路径或文件名声称看过内容。临时图片对应本次指定的当前聊天附件。')
+            if paths:
+                options['read_paths'] = paths
+                prompt += ('\n\n【本次需要读取的本地文件】\n' + '\n'.join(paths) +
+                    '\n请逐项尝试使用读取工具打开文件，说明成功或失败及原因。图片须实际使用能理解图像的工具，'
+                    '不得仅凭路径或文件名声称看过内容。临时图片对应本次指定的当前聊天附件。')
+            if directories:
+                options['read_dirs'] = directories
+                prompt += ('\n\n【本次任务可按需读取的资料目录】\n' + '\n'.join(directories) +
+                           '\n仅按本任务需要读取相关文件；不得声称已读取未打开的文件。')
         if getattr(a, 'trace', False): options['trace'] = True
         if getattr(a, 'timeout_seconds', 0) != 0: options['timeout_seconds'] = a.timeout_seconds
         with connect() as db:
@@ -422,6 +470,7 @@ def report(a, root, common, image_dir):
                   'omitted_attachment_markers': sum(item[3].count('[未同步的非文本附件: ') for item in pending),
                   'response': result['response'], 'usage': result.get('usage')}
         if paths: output['file_status'] = file_statuses(paths, result.get('_tool_trace', []), root)
+        if directories: output['directory_status'] = directory_statuses(directories, result.get('_tool_trace', []), root)
         if getattr(a, 'trace', False): output['tool_trace'] = result.get('_tool_trace', [])
         print(json.dumps(output, ensure_ascii=False))
 
